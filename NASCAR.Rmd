@@ -1,0 +1,2301 @@
+---
+title: "nascar1"
+output: html_document
+date: "2026-03-16"
+---
+
+```{r setup, include=FALSE}
+# ══════════════════════════════════════════════════════════════════════════════
+# SMGT 490 Capstone — NASCAR Behavioral Archetype Analysis
+# Full Analysis Workflow
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── PACKAGES ──────────────────────────────────────────────────────────────────
+#install.packages(c("nascaR.data", "tidyverse", "factoextra", "tibble",
+#                   "fmsb", "fpc", "broom", "ggalluvial", "randomForest"))
+
+library(nascaR.data)
+library(tidyverse)
+library(factoextra)
+library(tibble)
+library(fmsb)
+library(fpc)
+library(broom)
+library(ggalluvial)
+library(randomForest)
+library(tidyverse)
+
+
+# Or explicitly use dplyr's count
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1: DATA LOADING & TRACK CLASSIFICATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+cup <- load_series("cup")
+
+cup <- cup |>
+  mutate(
+    track_type = case_when(
+      Track == "Autodromo Hermanos Rodriguez" ~ "Road Course",
+      Track == "EchoPark Speedway"            ~ "Intermediate",
+      Surface == "road"                       ~ "Road Course",
+      Surface == "dirt"                       ~ "Dirt",
+      Surface == "paved" & Length <= 1.0      ~ "Short Track",
+      Surface == "paved" & Length < 2.0       ~ "Intermediate",
+      Surface == "paved" & Length >= 2.0      ~ "Superspeedway",
+      TRUE                                    ~ "Unknown"
+    )
+  )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2: FILTER TO STUDY PERIOD & FULL-TIME DRIVERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+cup_filtered <- cup |>
+  filter(Season >= 2017, Season <= 2024, track_type != "Dirt")
+
+driver_racecounts <- cup_filtered |>
+  dplyr::count(Driver, Season, name = "n_races")
+
+fulltime_drivers <- driver_racecounts |>
+  group_by(Driver) |>
+  summarise(avg_races = mean(n_races)) |>
+  filter(avg_races >= 30) |>
+  pull(Driver)
+
+cup_filtered <- cup |>
+  filter(
+    Season >= 2017,
+    Season <= 2024,
+    track_type != "Dirt",
+    Driver %in% fulltime_drivers
+  )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2.5: ADJUST FOR MAKE/TEAM EFFECTS (Decouple Quality from Behavior)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Create make-adjusted versions of key performance metrics
+cup_filtered <- cup_filtered |>
+  group_by(Season, Race, Make) |>
+  mutate(
+    # Adjust position gained by make average for that race
+    make_avg_pos_gained = mean(Start - Finish, na.rm = TRUE),
+    adj_pos_gained = (Start - Finish) - make_avg_pos_gained,
+    
+    # Adjust stage points by make average
+    make_avg_stage = mean(rowSums(across(c(S1, S2, S3)), na.rm = TRUE), na.rm = TRUE),
+    adj_stage_pts = rowSums(across(c(S1, S2, S3)), na.rm = TRUE) - make_avg_stage,
+    
+    # Adjust finish position by make average
+    make_avg_finish = mean(Finish, na.rm = TRUE),
+    adj_finish = Finish - make_avg_finish
+  ) |>
+  ungroup()
+
+# Optional: If you have team data, create team-adjusted versions
+# cup_filtered <- cup_filtered |>
+#   group_by(Season, Race, Team) |>
+#   mutate(
+#     team_avg_finish = mean(Finish, na.rm = TRUE),
+#     adj_finish_team = Finish - team_avg_finish
+#   ) |>
+#   ungroup()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3: OVERALL DRIVER PROFILES (Exploratory)
+# Note: these clusters largely reflect skill level rather than pure behavior.
+# The within-track-type approach in Section 5 is the primary analysis.
+# ══════════════════════════════════════════════════════════════════════════════
+
+driver_profiles <- cup_filtered |>
+  mutate(
+    pos_gained       = Start - Finish,
+    laps_led_pct     = Led / Laps,
+    stage_pts        = rowSums(across(c(S1, S2, S3)), na.rm = TRUE),
+    stage_efficiency = stage_pts / 30,
+    dnf              = if_else(Status == "running", 0L, 1L)
+  ) |>
+  group_by(Driver) |>
+  summarise(
+    n_races          = n(),
+    avg_pos_gained   = mean(pos_gained,       na.rm = TRUE),
+    avg_laps_led_pct = mean(laps_led_pct,     na.rm = TRUE),
+    avg_stage_eff    = mean(stage_efficiency, na.rm = TRUE),
+    finish_variance  = var(Finish,            na.rm = TRUE),
+    dnf_rate         = mean(dnf,              na.rm = TRUE),
+    avg_finish       = mean(Finish,           na.rm = TRUE)
+  )
+
+features_to_cluster <- c("avg_pos_gained", "avg_laps_led_pct",
+                          "avg_stage_eff", "finish_variance", "dnf_rate")
+
+driver_scaled <- driver_profiles |>
+  column_to_rownames("Driver") |>
+  select(all_of(features_to_cluster)) |>
+  scale()
+
+# Optimal k validation
+fviz_nbclust(driver_scaled, kmeans, method = "wss") +
+  labs(title = "Elbow Method — Overall Driver Profiles")
+
+fviz_nbclust(driver_scaled, kmeans, method = "silhouette") +
+  labs(title = "Silhouette Method — Overall Driver Profiles")
+
+# K-Means k=4
+set.seed(490)
+kmeans4 <- kmeans(driver_scaled, centers = 4, nstart = 25)
+
+driver_profiles <- driver_profiles |>
+  mutate(
+    cluster_k4 = factor(kmeans4$cluster),
+    archetype  = case_when(
+      cluster_k4 == 1 ~ "Backmarkers",
+      cluster_k4 == 2 ~ "Dominant Front-Runners",
+      cluster_k4 == 3 ~ "High Risk / DNF Prone",
+      cluster_k4 == 4 ~ "Reliable Mid-Packers"
+    )
+  )
+
+# Hierarchical clustering for stability comparison
+dist_matrix <- dist(driver_scaled, method = "euclidean")
+hc          <- hclust(dist_matrix, method = "ward.D2")
+
+fviz_dend(hc, k = 4, rect = TRUE, rect_fill = TRUE,
+          main = "Hierarchical Clustering Dendrogram (k=4)")
+
+hc_k4 <- cutree(hc, k = 4)
+driver_profiles <- driver_profiles |>
+  mutate(hc_cluster_k4 = factor(hc_k4))
+
+# Both methods agree perfectly on group membership
+table(KMeans = driver_profiles$cluster_k4,
+      Hierarchical = driver_profiles$hc_cluster_k4)
+
+# Bootstrap stability (500 iterations)
+set.seed(490)
+boot_kmeans <- clusterboot(driver_scaled, B = 500,
+                           clustermethod = kmeansCBI, k = 4, seed = 490)
+boot_hc     <- clusterboot(driver_scaled, B = 500,
+                           clustermethod = hclustCBI,
+                           method = "ward.D2", k = 4, seed = 490)
+
+data.frame(cluster = 1:4, jaccard = boot_kmeans$bootmean,
+           stability = ifelse(boot_kmeans$bootmean >= 0.75, "Stable",
+                       ifelse(boot_kmeans$bootmean >= 0.60, "Borderline", "Unstable")))
+
+data.frame(cluster = 1:4, jaccard = boot_hc$bootmean,
+           stability = ifelse(boot_hc$bootmean >= 0.75, "Stable",
+                       ifelse(boot_hc$bootmean >= 0.60, "Borderline", "Unstable")))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4: OVERALL ARCHETYPE VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+race_level <- cup_filtered |>
+  left_join(driver_profiles |> select(Driver, archetype), by = "Driver")
+
+# Relative finish vs field
+relative_finish <- race_level |>
+  group_by(Season, Race, track_type) |>
+  mutate(field_avg_finish = mean(Finish, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(relative_finish = Finish - field_avg_finish) |>
+  group_by(archetype, track_type) |>
+  summarise(avg_relative_finish = mean(relative_finish, na.rm = TRUE),
+            .groups = "drop")
+
+print(relative_finish)
+
+# ANOVA
+anova_results <- race_level |>
+  group_by(track_type) |>
+  group_modify(~ broom::tidy(aov(Finish ~ archetype, data = .x))) |>
+  filter(term == "archetype") |>
+  select(track_type, statistic, p.value)
+
+print(anova_results)
+
+# Tukey post-hoc
+tukey_results <- race_level |>
+  group_by(track_type) |>
+  group_modify(~ broom::tidy(TukeyHSD(aov(Finish ~ archetype, data = .x)))) |>
+  filter(adj.p.value < 0.05) |>
+  select(track_type, contrast, estimate, adj.p.value)
+
+print(tukey_results)
+
+# Logistic regression: top-10 predictor
+log_data <- race_level |>
+  mutate(
+    top10      = if_else(Finish <= 10, 1L, 0L),
+    archetype  = factor(archetype,
+                        levels = c("Reliable Mid-Packers", "Backmarkers",
+                                   "Dominant Front-Runners", "High Risk / DNF Prone")),
+    track_type = factor(track_type)
+  )
+
+log_model <- glm(top10 ~ archetype + track_type + archetype:track_type,
+                 data = log_data, family = binomial)
+
+summary(log_model)
+
+exp(cbind(OR = coef(log_model), confint(log_model))) |>
+  as.data.frame() |>
+  round(3)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5: WITHIN-TRACK-TYPE BEHAVIORAL CLUSTERING (PRIMARY ANALYSIS)
+# Rationale: drivers adapt behavior by track type. Clustering within each
+# track type captures genuine stylistic variation rather than overall skill.
+# ══════════════════════════════════════════════════════════════════════════════
+
+race_level_behavior <- cup_filtered |>
+  filter(track_type != "Dirt") |>
+  mutate(
+    stage_pts = rowSums(across(c(S1, S2, S3)), na.rm = TRUE),
+    dnf       = if_else(Status == "running", 0L, 1L)
+  ) |>
+  group_by(Season, Race, track_type) |>
+  mutate(
+    field_avg_start  = mean(Start,     na.rm = TRUE),
+    field_avg_finish = mean(Finish,    na.rm = TRUE),
+    field_avg_stage  = mean(stage_pts, na.rm = TRUE),
+    rel_pos_gained   = (Start - Finish) - (field_avg_start - field_avg_finish),
+    rel_stage_pts    = stage_pts - field_avg_stage,
+    rel_finish       = Finish - field_avg_finish
+  ) |>
+  ungroup()
+
+within_track_profiles <- race_level_behavior |>
+  group_by(Driver, track_type) |>
+  summarise(
+    n_races             = n(),
+    avg_rel_pos_gained  = mean(rel_pos_gained,  na.rm = TRUE),
+    avg_rel_stage_pts   = mean(rel_stage_pts,   na.rm = TRUE),
+    rel_finish_variance = var(rel_finish,        na.rm = TRUE),
+    dnf_rate            = mean(dnf,              na.rm = TRUE),
+    avg_rel_finish      = mean(rel_finish,       na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(n_races >= 10)
+
+features_within <- c("avg_rel_pos_gained", "avg_rel_stage_pts",
+                      "rel_finish_variance", "dnf_rate")
+
+set.seed(490)
+within_track_clusters <- within_track_profiles |>
+  group_by(track_type) |>
+  group_modify(~ {
+    scaled <- scale(.x[, features_within])
+    rownames(scaled) <- .x$Driver
+    km <- kmeans(scaled, centers = 3, nstart = 25)
+    .x |> mutate(cluster = factor(km$cluster))
+  }) |>
+  ungroup()
+
+within_track_clusters <- within_track_clusters |>
+  mutate(
+    archetype_label = case_when(
+      track_type == "Intermediate"  & cluster == 1 ~ "Stage Hunting Chargers",
+      track_type == "Intermediate"  & cluster == 2 ~ "Conservative Managers",
+      track_type == "Intermediate"  & cluster == 3 ~ "Position Climbers",
+      track_type == "Road Course"   & cluster == 1 ~ "Points Survivors",
+      track_type == "Road Course"   & cluster == 2 ~ "Road Course Racers",
+      track_type == "Road Course"   & cluster == 3 ~ "Road Course Strugglers",
+      track_type == "Short Track"   & cluster == 1 ~ "Crashers",
+      track_type == "Short Track"   & cluster == 2 ~ "Stage Point Collectors",
+      track_type == "Short Track"   & cluster == 3 ~ "Late Race Movers",
+      track_type == "Superspeedway" & cluster == 1 ~ "Aggressive Drafters",
+      track_type == "Superspeedway" & cluster == 2 ~ "Pack Racers",
+      track_type == "Superspeedway" & cluster == 3 ~ "Survive and Advance"
+    )
+  )
+
+# Cluster centroids
+centroid_df <- within_track_clusters |>
+  group_by(track_type, cluster) |>
+  summarise(
+    n                   = n(),
+    avg_rel_pos_gained  = round(mean(avg_rel_pos_gained), 3),
+    avg_rel_stage_pts   = round(mean(avg_rel_stage_pts), 3),
+    rel_finish_variance = round(mean(rel_finish_variance), 3),
+    dnf_rate            = round(mean(dnf_rate), 3),
+    avg_rel_finish      = round(mean(avg_rel_finish), 3),
+    .groups = "drop"
+  )
+
+View(centroid_df)
+
+# Behavioral shift analysis
+cluster_shifts_df <- within_track_clusters |>
+  select(Driver, track_type, cluster) |>
+  pivot_wider(names_from = track_type, values_from = cluster,
+              names_prefix = "cluster_") |>
+  rowwise() |>
+  mutate(
+    n_unique_clusters = n_distinct(
+      c(`cluster_Intermediate`, `cluster_Road Course`,
+        `cluster_Short Track`, `cluster_Superspeedway`),
+      na.rm = TRUE
+    )
+  ) |>
+  ungroup() |>
+  arrange(desc(n_unique_clusters), Driver)
+
+View(cluster_shifts_df)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6: VISUALIZATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+archetype_colors <- c(
+  "Stage Hunting Chargers"  = "#e74c3c",
+  "Conservative Managers"   = "#3498db",
+  "Position Climbers"       = "#2ecc71",
+  "Points Survivors"        = "#9b59b6",
+  "Road Course Racers"      = "#f39c12",
+  "Road Course Strugglers"  = "#1abc9c",
+  "Crashers"                = "#e67e22",
+  "Stage Point Collectors"  = "#34495e",
+  "Late Race Movers"        = "#27ae60",
+  "Aggressive Drafters"     = "#c0392b",
+  "Pack Racers"             = "#2980b9",
+  "Survive and Advance"     = "#8e44ad"
+)
+
+# 6A. Heatmap
+heatmap_df <- within_track_clusters |>
+  select(Driver, track_type, archetype_label, avg_rel_finish) |>
+  mutate(
+    Driver     = fct_reorder(Driver,
+                             avg_rel_finish * (track_type == "Intermediate"),
+                             .fun = sum),
+    track_type = factor(track_type,
+                        levels = c("Short Track", "Intermediate",
+                                   "Superspeedway", "Road Course"))
+  )
+
+ggplot(heatmap_df, aes(x = track_type, y = Driver, fill = archetype_label)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = archetype_label), size = 2.3,
+            color = "white", fontface = "bold") +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title    = "Driver Behavioral Archetypes by Track Type",
+       subtitle = "Drivers ordered by intermediate track relative finish",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "none", panel.grid = element_blank(),
+        axis.text.y = element_text(size = 8))
+
+# 6B. Bar charts
+bar_df <- within_track_clusters |>
+  group_by(track_type, archetype_label) |>
+  summarise(avg_rel_finish = mean(avg_rel_finish, na.rm = TRUE),
+            n = n(), .groups = "drop") |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course")))
+
+ggplot(bar_df, aes(x = reorder(archetype_label, avg_rel_finish),
+                   y = avg_rel_finish, fill = archetype_label)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = round(avg_rel_finish, 1)),
+            hjust = ifelse(bar_df$avg_rel_finish < 0, 1.1, -0.1),
+            size = 3, fontface = "bold") +
+  scale_fill_manual(values = archetype_colors) +
+  coord_flip() +
+  facet_wrap(~ track_type, scales = "free_x", ncol = 2) +
+  labs(title    = "Average Relative Finish by Archetype and Track Type",
+       subtitle = "Negative = better than field average",
+       x = NULL, y = "Avg Relative Finish vs Field") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold"),
+        panel.grid.major.y = element_blank())
+
+# 6C. Radar charts (one per track type)
+for (tt in c("Intermediate", "Road Course", "Short Track", "Superspeedway")) {
+  radar_df <- within_track_clusters |>
+    filter(track_type == tt) |>
+    group_by(archetype_label) |>
+    summarise(
+      `Pos Gained`      = mean(avg_rel_pos_gained,  na.rm = TRUE),
+      `Stage Pts`       = mean(avg_rel_stage_pts,   na.rm = TRUE),
+      `Finish Variance` = mean(rel_finish_variance, na.rm = TRUE),
+      `DNF Rate`        = mean(dnf_rate,            na.rm = TRUE),
+      .groups = "drop"
+    )
+  radar_matrix <- radar_df |>
+    select(-archetype_label) |>
+    mutate(across(everything(), ~ (. - min(.)) / (max(.) - min(.)))) |>
+    as.data.frame()
+  rownames(radar_matrix) <- radar_df$archetype_label
+  radar_plot_data <- rbind(rep(1, ncol(radar_matrix)),
+                           rep(0, ncol(radar_matrix)), radar_matrix)
+  cols <- archetype_colors[rownames(radar_matrix)]
+  par(mar = c(2, 2, 3, 2))
+  radarchart(radar_plot_data, axistype = 1, pcol = cols,
+             pfcol = adjustcolor(cols, alpha.f = 0.2), plwd = 2,
+             cglcol = "grey", cglty = 1, vlcex = 0.85,
+             title = paste("Behavioral Profiles —", tt))
+  legend("topright", legend = rownames(radar_matrix), col = cols,
+         lty = 1, lwd = 2, bty = "n", cex = 0.75)
+}
+
+# 6D. Alluvial diagram
+alluvial_df <- within_track_clusters |>
+  select(Driver, track_type, archetype_label) |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course"))) |>
+  pivot_wider(names_from = track_type, values_from = archetype_label) |>
+  drop_na() |>
+  pivot_longer(-Driver, names_to = "track_type", values_to = "archetype_label") |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course")))
+
+ggplot(alluvial_df,
+       aes(x = track_type, stratum = archetype_label, alluvium = Driver,
+           fill = archetype_label, label = archetype_label)) +
+  geom_flow(alpha = 0.4) +
+  geom_stratum() +
+  geom_text(stat = "stratum", size = 2.5, fontface = "bold") +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title    = "How Drivers Shift Behavioral Archetypes Across Track Types",
+       subtitle = "Each line represents one driver's journey across track types",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "none", axis.text.y = element_blank(),
+        panel.grid = element_blank())
+
+# 6E. Consistency dot plot
+consistency_df <- within_track_clusters |>
+  select(Driver, track_type, cluster) |>
+  pivot_wider(names_from = track_type, values_from = cluster) |>
+  rowwise() |>
+  mutate(n_unique = n_distinct(c(Intermediate, `Road Course`,
+                                  `Short Track`, Superspeedway),
+                               na.rm = TRUE)) |>
+  ungroup() |>
+  left_join(
+    within_track_clusters |>
+      group_by(Driver) |>
+      summarise(overall_avg_rel_finish = mean(avg_rel_finish, na.rm = TRUE)),
+    by = "Driver"
+  ) |>
+  mutate(consistency_label = case_when(
+    n_unique == 1 ~ "Rigid (1 style)",
+    n_unique == 2 ~ "Moderate (2 styles)",
+    n_unique == 3 ~ "Adaptive (3 styles)"
+  ))
+
+ggplot(consistency_df,
+       aes(x = n_unique, y = reorder(Driver, n_unique),
+           color = consistency_label, size = abs(overall_avg_rel_finish))) +
+  geom_jitter(width = 0.05, height = 0.3, alpha = 0.8) +
+  scale_color_manual(values = c("Rigid (1 style)"     = "#e74c3c",
+                                "Moderate (2 styles)" = "#f39c12",
+                                "Adaptive (3 styles)" = "#2ecc71")) +
+  scale_x_continuous(breaks = 1:3,
+                     labels = c("Rigid\n(1 style)", "Moderate\n(2 styles)",
+                                "Adaptive\n(3 styles)")) +
+  labs(title    = "Driver Behavioral Consistency Across Track Types",
+       subtitle = "Dot size = magnitude of avg relative finish vs field",
+       x = "Number of Unique Behavioral Styles", y = NULL,
+       color = "Consistency", size = "Avg Rel Finish\n(magnitude)") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        panel.grid.major.x = element_blank())
+
+# 6F. Individual driver profile (Chase Elliott)
+driver_name <- "Chase Elliott"
+
+elliott_archetypes <- within_track_clusters |>
+  filter(Driver == driver_name) |>
+  select(track_type, archetype_label, avg_rel_pos_gained,
+         avg_rel_stage_pts, rel_finish_variance, dnf_rate, avg_rel_finish) |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course")))
+
+ggplot(elliott_archetypes,
+       aes(x = track_type, y = 1, fill = archetype_label)) +
+  geom_tile(color = "white", linewidth = 2, height = 0.5) +
+  geom_text(aes(label = archetype_label), fontface = "bold",
+            color = "white", size = 4) +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title = paste(driver_name, "— Behavioral Archetype by Track Type"),
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), legend.position = "none",
+        panel.grid = element_blank(),
+        plot.title = element_text(face = "bold", size = 14))
+
+ggplot(elliott_archetypes,
+       aes(x = track_type, y = avg_rel_finish, fill = archetype_label)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = round(avg_rel_finish, 2)),
+            vjust = ifelse(elliott_archetypes$avg_rel_finish < 0, 1.5, -0.5),
+            fontface = "bold", size = 4) +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title    = paste(driver_name, "— Avg Relative Finish by Track Type"),
+       subtitle = "Negative = better than field average",
+       x = NULL, y = "Avg Relative Finish vs Field") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7: RACE OUTCOME PREDICTION MODEL
+# Two-stage Random Forest:
+#   Stage 1 — predict qualifying/starting position at Talladega
+#   Stage 2 — predict finish position, rank all drivers
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 7A. Build modeling dataset
+model_data <- cup_filtered |>
+  filter(track_type != "Dirt") |>
+  left_join(
+    within_track_clusters |>
+      select(Driver, track_type, archetype_label, avg_rel_finish),
+    by = c("Driver", "track_type")
+  ) |>
+  filter(!is.na(archetype_label), !is.na(Start)) |>
+  mutate(
+    archetype_label = factor(archetype_label),
+    track_type      = factor(track_type),
+    Season          = factor(Season)
+  ) |>
+  select(Finish, Start, track_type, archetype_label, Season, avg_rel_finish)
+
+# 7B. Train/test split (temporal)
+train_data <- model_data |> filter(Season %in% as.factor(2017:2022))
+test_data  <- model_data |> filter(Season %in% as.factor(2023:2024))
+
+# 7C. Train race finish model
+set.seed(490)
+rf_model <- randomForest(
+  Finish ~ Start + track_type + archetype_label + avg_rel_finish,
+  data = train_data, ntree = 500, mtry = 2, importance = TRUE
+)
+
+test_preds <- predict(rf_model, newdata = test_data)
+cat("Race Model RMSE:", round(sqrt(mean((test_preds - test_data$Finish)^2)), 3), "\n")
+cat("Race Model MAE:",  round(mean(abs(test_preds - test_data$Finish)), 3), "\n")
+
+importance(rf_model) |>
+  as.data.frame() |>
+  rownames_to_column("Feature") |>
+  arrange(desc(`%IncMSE`)) |>
+  View()
+
+# 7D. Qualifying model (Talladega)
+qualifying_data <- cup_filtered |>
+  filter(Track == "Talladega Superspeedway", !is.na(Start)) |>
+  left_join(
+    within_track_clusters |>
+      select(Driver, track_type, archetype_label, avg_rel_finish),
+    by = c("Driver", "track_type")
+  ) |>
+  filter(!is.na(archetype_label)) |>
+  mutate(archetype_label = factor(archetype_label),
+         track_type      = factor(track_type),
+         Season          = factor(Season))
+
+qual_train <- qualifying_data |> filter(Season %in% as.factor(2017:2022))
+qual_test  <- qualifying_data |> filter(Season %in% as.factor(2023:2024))
+
+set.seed(490)
+rf_qual <- randomForest(
+  Start ~ archetype_label + avg_rel_finish,
+  data = qual_train, ntree = 500, mtry = 1, importance = TRUE
+)
+
+qual_preds <- predict(rf_qual, newdata = qual_test)
+cat("Qualifying Model RMSE:", round(sqrt(mean((qual_preds - qual_test$Start)^2)), 3), "\n")
+cat("Qualifying Model MAE:",  round(mean(abs(qual_preds - qual_test$Start)), 3), "\n")
+
+# 7E. Simulate Talladega race
+qual_archetype_levels <- levels(factor(qual_train$archetype_label))
+
+set.seed(490)
+talladega_sim <- within_track_clusters |>
+  filter(track_type == "Superspeedway") |>
+  mutate(
+    archetype_label = factor(as.character(archetype_label),
+                             levels = qual_archetype_levels),
+    Season          = factor("2024", levels = levels(model_data$Season)),
+    track_type      = factor("Superspeedway",
+                             levels = levels(model_data$track_type))
+  )
+
+talladega_sim$predicted_start <- round(predict(rf_qual, newdata = talladega_sim))
+
+talladega_sim <- talladega_sim |>
+  arrange(predicted_start) |>
+  mutate(predicted_start = rank(predicted_start + runif(n(), -0.1, 0.1),
+                                ties.method = "random"))
+
+talladega_sim$Start           <- talladega_sim$predicted_start
+talladega_sim$archetype_label <- factor(as.character(talladega_sim$archetype_label),
+                                         levels = levels(model_data$archetype_label))
+talladega_sim$predicted_finish <- predict(rf_model, newdata = talladega_sim)
+
+talladega_results <- talladega_sim |>
+  arrange(predicted_finish) |>
+  mutate(predicted_rank   = row_number(),
+         predicted_start  = round(predicted_start),
+         predicted_finish = round(predicted_finish, 1)) |>
+  select(predicted_rank, Driver, archetype_label,
+         predicted_start, predicted_finish)
+
+View(talladega_results)
+
+# 7F. Visualization: predicted race order
+talladega_results <- talladega_results |>
+  mutate(archetype_label = as.character(archetype_label),
+         Driver = fct_reorder(Driver, desc(predicted_rank)))
+
+ggplot(talladega_results,
+       aes(x = predicted_finish, y = Driver, fill = archetype_label)) +
+  geom_col(show.legend = TRUE) +
+  geom_text(aes(label = paste0("#", predicted_rank, " — ", Driver)),
+            x = 0.5, hjust = 0, color = "white", fontface = "bold", size = 3.2) +
+  geom_text(aes(label = round(predicted_finish, 1)),
+            hjust = -0.2, size = 3, color = "grey30") +
+  scale_fill_manual(values = archetype_colors) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title    = "Predicted Talladega Superspeedway Race Order",
+       subtitle = "Starting positions predicted by qualifying model | Finish predicted by race model",
+       x = "Predicted Finish Position", y = NULL,
+       fill = "Superspeedway Archetype") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title      = element_text(face = "bold", size = 14),
+        plot.subtitle   = element_text(color = "grey40", size = 9),
+        axis.text.y     = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = "bottom")
+```
+
+```{r}
+library(tidyverse)
+library(randomForest)
+library(slider)
+# install.packages("slider") if needed
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1: BUILD ENHANCED FEATURE SET
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 1A. RECENT FORM (rolling avg finish, last 5 races) ────────────────────────
+recent_form <- cup_filtered |>
+  arrange(Driver, Season, Race) |>
+  group_by(Driver) |>
+  mutate(
+    recent_form_5 = lag(slide_dbl(Finish, mean, .before = 4, .complete = FALSE), 1)
+  ) |>
+  ungroup() |>
+  select(Driver, Season, Race, Track, recent_form_5)
+
+# ── 1B. TRACK-SPECIFIC HISTORY ────────────────────────────────────────────────
+track_history <- cup_filtered |>
+  arrange(Driver, Track, Season, Race) |>
+  group_by(Driver, Track) |>
+  mutate(
+    track_hist_avg = lag(cummean(Finish), 1)
+  ) |>
+  ungroup() |>
+  select(Driver, Season, Race, Track, track_hist_avg)
+
+# ── 1C. JOIN ALL FEATURES ─────────────────────────────────────────────────────
+enhanced_model_data <- cup_filtered |>
+  filter(track_type != "Dirt") |>
+  left_join(recent_form,   by = c("Driver", "Season", "Race", "Track")) |>
+  left_join(track_history, by = c("Driver", "Season", "Race", "Track")) |>
+  left_join(
+    within_track_clusters |>
+      select(Driver, track_type, archetype_label, avg_rel_finish),
+    by = c("Driver", "track_type")
+  ) |>
+  filter(!is.na(archetype_label), !is.na(Start)) |>
+  mutate(
+    archetype_label = factor(archetype_label),
+    track_type      = factor(track_type),
+    Season          = factor(Season),
+    Make            = factor(Make),
+    # Replace NA stage points with 0 — NA means no points scored that stage
+    S1 = replace_na(S1, 0),
+    S2 = replace_na(S2, 0),
+    S3 = replace_na(S3, 0)
+  ) |>
+  group_by(Driver) |>
+  mutate(
+    recent_form_5  = if_else(is.na(recent_form_5),
+                             mean(Finish, na.rm = TRUE), recent_form_5),
+    track_hist_avg = if_else(is.na(track_hist_avg),
+                             mean(Finish, na.rm = TRUE), track_hist_avg)
+  ) |>
+  ungroup()
+
+cat("Rows:", nrow(enhanced_model_data), "\n")
+cat("NAs:", sum(is.na(enhanced_model_data |>
+      select(Finish, Start, track_type, archetype_label,
+             avg_rel_finish, recent_form_5, track_hist_avg, Make,
+             S1, S2, S3))), "\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2: TRAIN ENHANCED RACE FINISH MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+train_enhanced <- enhanced_model_data |>
+  filter(Season %in% as.factor(2017:2022))
+
+test_enhanced <- enhanced_model_data |>
+  filter(Season %in% as.factor(2023:2024))
+
+set.seed(490)
+rf_enhanced <- randomForest(
+  Finish ~ Start + track_type + archetype_label + avg_rel_finish +
+           recent_form_5 + track_hist_avg + Make,
+  data       = train_enhanced,
+  ntree      = 500,
+  mtry       = 3,
+  importance = TRUE
+)
+
+test_preds_enhanced <- predict(rf_enhanced, newdata = test_enhanced)
+rmse_enhanced <- sqrt(mean((test_preds_enhanced - test_enhanced$Finish)^2))
+mae_enhanced  <- mean(abs(test_preds_enhanced - test_enhanced$Finish))
+
+cat("Enhanced Model RMSE:", round(rmse_enhanced, 3), "\n")
+cat("Enhanced Model MAE:",  round(mae_enhanced, 3), "\n")
+cat("Original Model RMSE: 10.829 | MAE: 8.928\n")
+
+# Feature importance
+importance(rf_enhanced) |>
+  as.data.frame() |>
+  rownames_to_column("Feature") |>
+  arrange(desc(`%IncMSE`)) |>
+  View()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3: STAGE POINTS PREDICTION MODELS (S1, S2, S3)
+# Note: treating as regression despite few unique values — acceptable for our
+# purposes since we care about relative stage point predictions, not exact values
+# ══════════════════════════════════════════════════════════════════════════════
+
+stage_train <- enhanced_model_data |> filter(Season %in% as.factor(2017:2022))
+stage_test  <- enhanced_model_data |> filter(Season %in% as.factor(2023:2024))
+
+set.seed(490)
+rf_s1 <- randomForest(
+  S1 ~ Start + track_type + archetype_label + avg_rel_finish +
+       recent_form_5 + track_hist_avg + Make,
+  data = stage_train, ntree = 500, mtry = 3, importance = TRUE
+)
+
+set.seed(490)
+rf_s2 <- randomForest(
+  S2 ~ Start + track_type + archetype_label + avg_rel_finish +
+       recent_form_5 + track_hist_avg + Make,
+  data = stage_train, ntree = 500, mtry = 3, importance = TRUE
+)
+
+set.seed(490)
+rf_s3 <- randomForest(
+  S3 ~ Start + track_type + archetype_label + avg_rel_finish +
+       recent_form_5 + track_hist_avg + Make,
+  data = stage_train, ntree = 500, mtry = 3, importance = TRUE
+)
+
+eval_stage <- function(model, test, outcome) {
+  preds <- predict(model, newdata = test)
+  rmse  <- sqrt(mean((preds - test[[outcome]])^2, na.rm = TRUE))
+  mae   <- mean(abs(preds  - test[[outcome]]),    na.rm = TRUE)
+  cat(outcome, "— RMSE:", round(rmse, 3), "| MAE:", round(mae, 3), "\n")
+}
+
+eval_stage(rf_s1, stage_test, "S1")
+eval_stage(rf_s2, stage_test, "S2")
+eval_stage(rf_s3, stage_test, "S3")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4: PREDICT ALL RACES IN TEST SET (2023-2024)
+# ══════════════════════════════════════════════════════════════════════════════
+
+test_races <- test_enhanced |>
+  distinct(Season, Race, Track, track_type) |>
+  arrange(Season, Race)
+
+cat("Total races to predict:", nrow(test_races), "\n")
+
+all_race_predictions <- test_enhanced |>
+  mutate(
+    pred_finish = predict(rf_enhanced, newdata = test_enhanced),
+    pred_s1     = predict(rf_s1,       newdata = test_enhanced),
+    pred_s2     = predict(rf_s2,       newdata = test_enhanced),
+    pred_s3     = predict(rf_s3,       newdata = test_enhanced)
+  ) |>
+  group_by(Season, Race, Track, track_type) |>
+  mutate(
+    pred_rank   = rank(pred_finish, ties.method = "random"),
+    actual_rank = rank(Finish,      ties.method = "random")
+  ) |>
+  ungroup()
+
+# ── EVALUATION ────────────────────────────────────────────────────────────────
+accuracy_summary <- all_race_predictions |>
+  group_by(Season, Race, Track) |>
+  summarise(
+    rank_correlation = cor(pred_rank, actual_rank, method = "spearman"),
+    top5_overlap     = length(intersect(Driver[pred_rank  <= 5],
+                                        Driver[actual_rank <= 5])) / 5,
+    top10_overlap    = length(intersect(Driver[pred_rank  <= 10],
+                                        Driver[actual_rank <= 10])) / 10,
+    .groups = "drop"
+  )
+
+cat("\n── Overall Prediction Accuracy (2023-2024) ──\n")
+cat("Avg Spearman Rank Correlation:",
+    round(mean(accuracy_summary$rank_correlation, na.rm = TRUE), 3), "\n")
+cat("Avg Top-5 Overlap:",
+    round(mean(accuracy_summary$top5_overlap,  na.rm = TRUE) * 100, 1), "%\n")
+cat("Avg Top-10 Overlap:",
+    round(mean(accuracy_summary$top10_overlap, na.rm = TRUE) * 100, 1), "%\n")
+
+View(accuracy_summary)
+
+# ── PREDICTED POINTS STANDINGS (2023-2024) ────────────────────────────────────
+predicted_standings <- all_race_predictions |>
+  mutate(
+    pred_race_pts    = pmax(0, 41 - pred_rank),
+    pred_total_pts   = pred_race_pts + round(pred_s1) + round(pred_s2) + round(pred_s3),
+    actual_race_pts  = pmax(0, 41 - actual_rank),
+    actual_total_pts = actual_race_pts + S1 + S2 + S3
+  ) |>
+  group_by(Season, Driver) |>
+  summarise(
+    pred_season_pts   = sum(pred_total_pts,   na.rm = TRUE),
+    actual_season_pts = sum(actual_total_pts, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(Season) |>
+  mutate(
+    pred_standing   = rank(-pred_season_pts,   ties.method = "min"),
+    actual_standing = rank(-actual_season_pts, ties.method = "min")
+  ) |>
+  ungroup() |>
+  arrange(Season, pred_standing)
+
+View(predicted_standings)
+```
+```{r}
+# ── CORRECT NASCAR POINTS LOOKUP TABLE ────────────────────────────────────────
+race_points_table <- tibble(
+  position = 1:40,
+  race_pts = c(40, 35, 34, 33, 32, 31, 30, 29, 28, 27,
+               26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+               16, 15, 14, 13, 12, 11, 10,  9,  8,  7,
+                6,  5,  4,  3,  2,  1,  1,  1,  1,  1)
+)
+
+stage_points_table <- tibble(
+  position  = 1:10,
+  stage_pts = 10:1
+)
+
+# ── REBUILD PREDICTED STANDINGS WITH CORRECT POINTS ───────────────────────────
+predicted_standings <- all_race_predictions |>
+  # Round predicted stage points and cap at valid range
+  mutate(
+    pred_s1_pts = pmin(pmax(round(pred_s1), 0), 10),
+    pred_s2_pts = pmin(pmax(round(pred_s2), 0), 10),
+    pred_s3_pts = pmin(pmax(round(pred_s3), 0), 10),
+    # Join race points by predicted rank
+    pred_rank_capped   = pmin(pred_rank,   40),
+    actual_rank_capped = pmin(actual_rank, 40)
+  ) |>
+  left_join(race_points_table,
+            by = c("pred_rank_capped" = "position")) |>
+  rename(pred_race_pts = race_pts) |>
+  left_join(race_points_table,
+            by = c("actual_rank_capped" = "position")) |>
+  rename(actual_race_pts = race_pts) |>
+  mutate(
+    # Actual stage points are already in S1/S2/S3 columns
+    pred_total_pts   = pred_race_pts   + pred_s1_pts + pred_s2_pts + pred_s3_pts,
+    actual_total_pts = actual_race_pts + S1 + S2 + S3
+  ) |>
+  group_by(Season, Driver) |>
+  summarise(
+    pred_season_pts   = sum(pred_total_pts,   na.rm = TRUE),
+    actual_season_pts = sum(actual_total_pts, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  group_by(Season) |>
+  mutate(
+    pred_standing   = rank(-pred_season_pts,   ties.method = "min"),
+    actual_standing = rank(-actual_season_pts, ties.method = "min"),
+    standing_diff   = actual_standing - pred_standing
+  ) |>
+  ungroup() |>
+  arrange(Season, pred_standing)
+
+View(predicted_standings)
+
+# How accurate are our predicted standings vs actual?
+predicted_standings |>
+  group_by(Season) |>
+  summarise(
+    standing_correlation = cor(pred_standing, actual_standing,
+                               method = "spearman"),
+    avg_standing_error   = mean(abs(standing_diff), na.rm = TRUE)
+  )
+```
+```{r}
+cup_filtered |>
+  distinct(Season, Race, Track, track_type) |>
+  dplyr::count(Season, track_type) |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course"))) |>
+  ggplot(aes(x = factor(Season), y = n, fill = track_type)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c("Short Track"   = "#e74c3c",
+                               "Intermediate"  = "#3498db",
+                               "Superspeedway" = "#2ecc71",
+                               "Road Course"   = "#f39c12")) +
+  labs(title    = "Race Count by Track Type and Season (2017-2024)",
+       x        = "Season",
+       y        = "Number of Races",
+       fill     = "Track Type") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r}
+# Run this for one track type as an example — Intermediate
+intermediate_profiles <- within_track_profiles |>
+  filter(track_type == "Intermediate")
+
+features_within <- c("avg_rel_pos_gained", "avg_rel_stage_pts",
+                      "rel_finish_variance", "dnf_rate")
+
+intermediate_scaled <- intermediate_profiles |>
+  select(all_of(features_within)) |>
+  scale()
+
+p_elbow <- fviz_nbclust(intermediate_scaled, kmeans, method = "wss") +
+  labs(title = "Elbow Method — Intermediate Tracks")
+
+p_silhouette <- fviz_nbclust(intermediate_scaled, kmeans, method = "silhouette") +
+  labs(title = "Silhouette Method — Intermediate Tracks")
+
+print(p_elbow)
+print(p_silhouette)
+```
+
+```{r}
+# ── HEATMAP: DRIVER ARCHETYPES BY TRACK TYPE ──────────────────────────────────
+heatmap_df <- within_track_clusters |>
+  select(Driver, track_type, archetype_label, avg_rel_finish) |>
+  mutate(
+    Driver     = fct_reorder(Driver,
+                             avg_rel_finish * (track_type == "Intermediate"),
+                             .fun = sum),
+    track_type = factor(track_type,
+                        levels = c("Short Track", "Intermediate",
+                                   "Superspeedway", "Road Course"))
+  )
+
+ggplot(heatmap_df, aes(x = track_type, y = Driver, fill = archetype_label)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = archetype_label), size = 2.3,
+            color = "white", fontface = "bold") +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title    = "Driver Behavioral Archetypes by Track Type",
+       subtitle = "Drivers ordered by intermediate track relative finish",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title      = element_text(face = "bold", size = 14),
+        legend.position = "none",
+        panel.grid      = element_blank(),
+        axis.text.y     = element_text(size = 8))
+
+
+# ── RADAR CHARTS: BEHAVIORAL PROFILES PER TRACK TYPE ──────────────────────────
+for (tt in c("Intermediate", "Road Course", "Short Track", "Superspeedway")) {
+
+  radar_df <- within_track_clusters |>
+    filter(track_type == tt) |>
+    group_by(archetype_label) |>
+    summarise(
+      `Pos Gained`      = mean(avg_rel_pos_gained,  na.rm = TRUE),
+      `Stage Pts`       = mean(avg_rel_stage_pts,   na.rm = TRUE),
+      `Finish Variance` = mean(rel_finish_variance, na.rm = TRUE),
+      `DNF Rate`        = mean(dnf_rate,            na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  radar_matrix <- radar_df |>
+    select(-archetype_label) |>
+    mutate(across(everything(), ~ (. - min(.)) / (max(.) - min(.)))) |>
+    as.data.frame()
+
+  rownames(radar_matrix) <- radar_df$archetype_label
+
+  radar_plot_data <- rbind(
+    rep(1, ncol(radar_matrix)),
+    rep(0, ncol(radar_matrix)),
+    radar_matrix
+  )
+
+  cols <- archetype_colors[rownames(radar_matrix)]
+
+  par(mar = c(2, 2, 3, 2))
+  radarchart(
+    radar_plot_data,
+    axistype = 1,
+    pcol     = cols,
+    pfcol    = adjustcolor(cols, alpha.f = 0.2),
+    plwd     = 2,
+    cglcol   = "grey",
+    cglty    = 1,
+    vlcex    = 0.85,
+    title    = paste("Behavioral Profiles —", tt)
+  )
+  legend("topright", legend = rownames(radar_matrix), col = cols,
+         lty = 1, lwd = 2, bty = "n", cex = 0.75)
+}
+```
+```{r}
+driver_name <- "Chase Elliott"
+
+elliott_archetypes <- within_track_clusters |>
+  filter(Driver == driver_name) |>
+  select(track_type, archetype_label, avg_rel_pos_gained,
+         avg_rel_stage_pts, rel_finish_variance, dnf_rate, avg_rel_finish) |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course")))
+
+# ── CHART 1: ARCHETYPE JOURNEY ────────────────────────────────────────────────
+ggplot(elliott_archetypes,
+       aes(x = track_type, y = 1, fill = archetype_label)) +
+  geom_tile(color = "white", linewidth = 2, height = 0.5) +
+  geom_text(aes(label = archetype_label),
+            fontface = "bold", color = "white", size = 4) +
+  scale_fill_manual(values = archetype_colors) +
+  labs(
+    title = paste(driver_name, "— Behavioral Archetype by Track Type"),
+    x = NULL, y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y     = element_blank(),
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    plot.title      = element_text(face = "bold", size = 14)
+  )
+
+# ── CHART 2: RELATIVE FINISH BY TRACK TYPE ────────────────────────────────────
+ggplot(elliott_archetypes,
+       aes(x = track_type, y = avg_rel_finish, fill = archetype_label)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = round(avg_rel_finish, 2)),
+            vjust = ifelse(elliott_archetypes$avg_rel_finish < 0, 1.5, -0.5),
+            fontface = "bold", size = 4) +
+  scale_fill_manual(values = archetype_colors) +
+  labs(
+    title    = paste(driver_name, "— Avg Relative Finish by Track Type"),
+    subtitle = "Negative = better than field average",
+    x = NULL, y = "Avg Relative Finish vs Field"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```
+```{r}
+bar_df <- within_track_clusters |>
+  group_by(track_type, archetype_label) |>
+  summarise(
+    avg_rel_finish = mean(avg_rel_finish, na.rm = TRUE),
+    n              = n(),
+    .groups        = "drop"
+  ) |>
+  mutate(
+    track_type     = factor(track_type,
+                            levels = c("Short Track", "Intermediate",
+                                       "Superspeedway", "Road Course")),
+    # Drop factor levels not present in each track type
+    archetype_label = factor(archetype_label)
+  )
+
+ggplot(bar_df, aes(x = reorder(archetype_label, avg_rel_finish),
+                   y = avg_rel_finish, fill = archetype_label)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = round(avg_rel_finish, 1)),
+            hjust = ifelse(bar_df$avg_rel_finish < 0, 1.1, -0.1),
+            size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = archetype_colors) +
+  coord_flip() +
+  facet_wrap(~ track_type, scales = "free", ncol = 2) +
+  labs(
+    title    = "Average Relative Finish by Archetype and Track Type",
+    subtitle = "Negative = better than field average",
+    x        = NULL,
+    y        = "Avg Relative Finish vs Field"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 14),
+    strip.text         = element_text(face = "bold"),
+    panel.grid.major.y = element_blank()
+  )
+```
+```{r}
+predicted_standings |>
+  mutate(Season = as.character(Season)) |>
+  ggplot(aes(x = actual_standing, y = pred_standing, 
+             label = Driver, color = Season)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_abline(slope = 1, intercept = 0, 
+              linetype = "dashed", color = "grey40") +
+  geom_text(size = 2.5, vjust = -0.5, check_overlap = TRUE) +
+  scale_color_manual(values = c("2023" = "#e74c3c", "2024" = "#3498db")) +
+  facet_wrap(~ Season) +
+  labs(
+    title    = "Predicted vs Actual Championship Standings (2023-2024)",
+    subtitle = "Points along dashed line = perfect prediction",
+    x        = "Actual Standing",
+    y        = "Predicted Standing"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title      = element_text(face = "bold"),
+        legend.position = "none")
+```
+```{r}
+# 1. Alluvial Diagram (already in your code) — but make it presentation-ready
+library(ggalluvial)
+library(scales)
+
+# Enhanced alluvial with cleaner labels
+alluvial_plot <- within_track_clusters |>
+  select(Driver, track_type, archetype_label) |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course"))) |>
+  ggplot(aes(x = track_type, stratum = archetype_label, alluvium = Driver,
+             fill = archetype_label, label = archetype_label)) +
+  geom_flow(alpha = 0.6, color = "white", size = 0.2) +
+  geom_stratum(width = 0.35, color = "white", size = 0.3) +
+  geom_text(stat = "stratum", size = 3.2, fontface = "bold", color = "white") +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title = "Drivers Don't Have One Racing Identity",
+       subtitle = "Each driver shifts behavioral archetypes across track types | Lines represent individual drivers",
+       x = NULL, y = NULL,
+       caption = "Source: NASCAR Cup Series 2017-2024 | N=32 full-time drivers") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 18, color = "#1a1a2e"),
+        plot.subtitle = element_text(size = 11, color = "gray40"),
+        legend.position = "none",
+        axis.text.y = element_blank(),
+        panel.grid = element_blank(),
+        strip.text = element_text(face = "bold"),
+        plot.caption = element_text(size = 8, color = "gray50"))
+
+alluvial_plot
+
+# Save for presentation
+ggsave("alluvial_driver_shifts.png", alluvial_plot, width = 12, height = 8, dpi = 300) 
+```
+```{r}
+# 2. Dot plot with confidence/range
+library(ggrepel)
+
+performance_range <- within_track_clusters |>
+  group_by(track_type, archetype_label) |>
+  summarise(
+    avg_rel_finish = mean(avg_rel_finish, na.rm = TRUE),
+    se = sd(avg_rel_finish, na.rm = TRUE) / sqrt(n()),
+    lower_ci = avg_rel_finish - 1.96 * se,
+    upper_ci = avg_rel_finish + 1.96 * se,
+    n = n(),
+    .groups = "drop"
+  ) |>
+  mutate(
+    track_type = factor(track_type, levels = c("Short Track", "Intermediate", 
+                                                "Superspeedway", "Road Course")),
+    # Color by performance (red = bad, green = good)
+    performance_color = ifelse(avg_rel_finish < 0, "Better than field", "Worse than field")
+  )
+
+ggplot(performance_range, aes(x = avg_rel_finish, y = reorder(archetype_label, avg_rel_finish),
+                                color = performance_color)) +
+  geom_point(size = 5) +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0.2, linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 1) +
+  geom_text(aes(label = round(avg_rel_finish, 1)), 
+            hjust = ifelse(performance_range$avg_rel_finish < 0, -0.5, 1.5),
+            size = 4, fontface = "bold") +
+  scale_color_manual(values = c("Better than field" = "#2ecc71", 
+                                 "Worse than field" = "#e74c3c")) +
+  facet_wrap(~ track_type, scales = "free_y", ncol = 2) +
+  labs(title = "Archetype Strongly Predicts Performance",
+       subtitle = "Difference between best and worst archetype: 8-9 positions | Error bars = 95% CI",
+       x = "Average Relative Finish (Negative = Better than Field)",
+       y = NULL,
+       caption = "Position difference: e.g., -3 = finishes 3 positions AHEAD of field average") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 16),
+        plot.subtitle = element_text(size = 10, color = "gray40"),
+        legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 12),
+        panel.grid.major.y = element_blank())
+
+ggsave("performance_by_archetype.png", width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+# 3. Heatmap - Sorted by performance
+library(gt)
+
+# Get driver performance ranking (average relative finish on intermediates)
+driver_performance <- within_track_clusters |>
+  filter(track_type == "Intermediate") |>
+  select(Driver, avg_rel_finish) |>
+  rename(intermediate_perf = avg_rel_finish)
+
+# Create driver x track type matrix with performance sorting
+driver_matrix <- within_track_clusters |>
+  select(Driver, track_type, archetype_label) |>
+  mutate(track_type = factor(track_type, 
+                             levels = c("Short Track", "Intermediate",
+```
+
+
+```{r}
+"Superspeedway", "Road Course"))) |>
+  pivot_wider(names_from = track_type, values_from = archetype_label, 
+              values_fill = "—") |>
+  left_join(driver_performance, by = "Driver") |>
+  arrange(intermediate_perf) |>  # Sort by best to worst on intermediates
+  select(-intermediate_perf)
+
+# Create styled table
+driver_matrix |>
+  select(Driver, `Short Track`, Intermediate, Superspeedway, `Road Course`) |>
+  gt() |>
+  tab_header(
+    title = "Driver Behavioral Archetypes by Track Type",
+    subtitle = "Drivers sorted by Intermediate track performance (best at top) | — = insufficient races"
+  ) |>
+  data_color(
+    columns = c(`Short Track`, Intermediate, Superspeedway, `Road Course`),
+    palette = c("#e74c3c", "#f39c12", "#2ecc71", "#3498db", "#9b59b6", "#1abc9c",
+                "#e67e22", "#34495e", "#27ae60", "#c0392b", "#2980b9", "#8e44ad"),
+    apply_to = "text"
+  ) |>
+  opt_table_font(font = list(google_font("Lato"), default_fonts())) |>
+  tab_options(
+    table.font.size = 10,
+    column_labels.font.size = 11,
+    column_labels.font.weight = "bold",
+    heading.title.font.size = 16,
+    heading.subtitle.font.size = 11
+  ) |>
+  cols_align(align = "center", columns = everything())
+
+ggsave("driver_archetype_matrix_sorted.png", width = 14, height = 12, dpi = 300)
+
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMPLIFIED RACE PREDICTION MODEL (Run this first)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Build modeling dataset
+model_data <- cup_filtered |>
+  filter(track_type != "Dirt") |>
+  left_join(
+    within_track_clusters |>
+      select(Driver, track_type, archetype_label, avg_rel_finish),
+    by = c("Driver", "track_type")
+  ) |>
+  filter(!is.na(archetype_label), !is.na(Start)) |>
+  mutate(
+    archetype_label = factor(archetype_label),
+    track_type      = factor(track_type),
+    Season          = factor(Season)
+  ) |>
+  select(Finish, Start, track_type, archetype_label, Season, avg_rel_finish)
+
+# Train/test split
+train_data <- model_data |> filter(Season %in% as.factor(2017:2022))
+test_data  <- model_data |> filter(Season %in% as.factor(2023:2024))
+
+# Train Random Forest
+set.seed(490)
+rf_model <- randomForest(
+  Finish ~ Start + track_type + archetype_label + avg_rel_finish,
+  data = train_data, 
+  ntree = 500, 
+  mtry = 2, 
+  importance = TRUE
+)
+
+# Check the model
+print(rf_model)
+```
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# FEATURE IMPORTANCE PLOT - WIDE VERSION (FIXED margin error)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Extract importance
+importance_df <- importance(rf_model) |>
+  as.data.frame() |>
+  rownames_to_column("Feature") |>
+  arrange(desc(`%IncMSE`)) |>
+  mutate(
+    Feature = factor(Feature, levels = Feature),
+    Feature_clean = case_when(
+      Feature == "avg_rel_finish" ~ "Historical Performance at Track Type",
+      Feature == "Start" ~ "Starting Position",
+      Feature == "archetype_label" ~ "Behavioral Archetype",
+      Feature == "track_type" ~ "Track Type"
+    )
+  )
+
+# Calculate max value for x-axis limit (add 20% headroom)
+max_mse <- max(importance_df$`%IncMSE`)
+
+# Create plot with wider dimensions (NO margin line needed)
+p <- ggplot(importance_df, aes(x = `%IncMSE`, y = reorder(Feature_clean, `%IncMSE`), 
+                                fill = `%IncMSE`)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  geom_text(aes(label = paste0(round(`%IncMSE`, 1), "%")), 
+            hjust = -0.3, size = 5.5, fontface = "bold") +
+  scale_fill_gradient(low = "#3498db", high = "#e74c3c") +
+  # Extend x-axis to 25% beyond max value
+  scale_x_continuous(limits = c(0, max_mse * 1.25),
+                     expand = expansion(mult = c(0.01, 0))) +
+  labs(title = "What Predicts Race Finishes?",
+       subtitle = "Behavioral Archetype ranks #3 in importance, ahead of Track Type",
+       x = "% Increase in Mean Squared Error (Higher = More Important)",
+       y = NULL,
+       caption = "Model: Random Forest | Data: 2017-2022 train, 2023-2024 test") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 16, color = "#1a1a2e"),
+        plot.subtitle = element_text(size = 11, color = "gray40"),
+        panel.grid.major.y = element_blank(),
+        axis.text = element_text(size = 11),
+        axis.title.x = element_text(size = 11))
+
+p
+
+# Save with wider dimensions
+ggsave("feature_importance_race_model.png", p, width = 12, height = 5, dpi = 300)
+```
+
+```{r}
+
+# 4. Driver comparison radar (e.g., Chase Elliott vs. Ricky Stenhouse Jr. on Superspeedways)
+compare_drivers <- c("Chase Elliott", "Ricky Stenhouse Jr.")
+track_to_compare <- "Superspeedway"
+
+radar_compare <- within_track_clusters |>
+  filter(track_type == track_to_compare, Driver %in% compare_drivers) |>
+  select(Driver, avg_rel_pos_gained, avg_rel_stage_pts, 
+         rel_finish_variance, dnf_rate, avg_rel_finish) |>
+  mutate(
+    # Normalize 0-1 (higher = better for pos_gained and stage_pts)
+    # For variance and DNF, lower = better, so invert
+    pos_gained_norm = (avg_rel_pos_gained - min(avg_rel_pos_gained)) / 
+                      (max(avg_rel_pos_gained) - min(avg_rel_pos_gained)),
+    stage_pts_norm = (avg_rel_stage_pts - min(avg_rel_stage_pts)) / 
+                     (max(avg_rel_stage_pts) - min(avg_rel_stage_pts)),
+    variance_norm = 1 - ((rel_finish_variance - min(rel_finish_variance)) / 
+                          (max(rel_finish_variance) - min(rel_finish_variance))),
+    dnf_norm = 1 - ((dnf_rate - min(dnf_rate)) / (max(dnf_rate) - min(dnf_rate)))
+  ) |>
+  select(Driver, pos_gained_norm, stage_pts_norm, variance_norm, dnf_norm)
+
+# Create radar plot
+library(fmsb)
+
+radar_matrix_compare <- radar_compare |>
+  column_to_rownames("Driver") |>
+  as.data.frame()
+
+# Add max/min rows
+radar_matrix_compare <- rbind(rep(1, 4), rep(0, 4), radar_matrix_compare)
+
+radarchart(radar_matrix_compare, 
+           axistype = 1,
+           pcol = c("#e74c3c", "#3498db"),
+           pfcol = c(rgb(231, 76, 60, alpha = 80, maxColorValue = 255),
+                     rgb(52, 152, 219, alpha = 80, maxColorValue = 255)),
+           plwd = 3,
+           cglcol = "grey",
+           cglty = 1,
+           cglwd = 0.8,
+           vlcex = 1.2,
+           title = paste(track_to_compare, "Behavioral Profile Comparison"))
+
+legend("topright", 
+       legend = compare_drivers,
+       col = c("#e74c3c", "#3498db"),
+       lty = 1, lwd = 3, bty = "n", cex = 1.2)
+
+ggsave("driver_comparison_radar.png", width = 8, height = 8, dpi = 300)
+```
+
+```{r}
+p <- ggplot(importance_df, aes(x = `%IncMSE`, y = reorder(Feature_clean, `%IncMSE`), 
+                                fill = `%IncMSE`)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = paste0(round(`%IncMSE`, 1), "%")), 
+            hjust = -0.2, size = 4.5, fontface = "bold") +
+  scale_fill_gradient(low = "#3498db", high = "#e74c3c") +
+  scale_x_continuous(limits = c(0, max_mse * 1.15),
+                     expand = expansion(mult = c(0.01, 0))) +
+  labs(title = "Behavioral Archetype Ranks #3 in Predictive Importance",
+       subtitle = "Increase in MSE when feature is removed from Random Forest model",
+       x = "% Increase in Mean Squared Error (Higher = More Important)",
+       y = NULL,
+       caption = "Model predicts finish position | Data: 2017-2022 train, 2023-2024 test") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 16),
+        plot.subtitle = element_text(size = 11, color = "gray40"),
+        panel.grid.major.y = element_blank(),
+        axis.text = element_text(size = 11))
+
+p
+
+ggsave("feature_importance.png", p, width = 12, height = 6, dpi = 300)
+```
+```{r}
+# 6. Predicted vs. Actual Championship Standings
+standings_plot <- predicted_standings |>
+  filter(Season %in% c(2023, 2024)) |>
+  mutate(
+    Season_label = paste(Season, "Season"),
+    performance = ifelse(pred_standing <= 10, "Playoff Driver", 
+                         ifelse(pred_standing <= 16, "Bubble", "Outside Playoffs"))
+  ) |>
+  ggplot(aes(x = pred_standing, y = actual_standing, 
+             color = performance, label = Driver)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50", linewidth = 1) +
+  geom_point(size = 4, alpha = 0.8) +
+  geom_text_repel(size = 3, max.overlaps = 15) +
+  scale_x_reverse(limits = c(32, 1)) +
+  scale_y_reverse(limits = c(32, 1)) +
+  scale_color_manual(values = c("Playoff Driver" = "#2ecc71", 
+                                 "Bubble" = "#f39c12", 
+                                 "Outside Playoffs" = "#e74c3c")) +
+  facet_wrap(~ Season_label) +
+  labs(title = "Predicted Championship Standings vs. Actual",
+       subtitle = "Spearman correlation: 0.828 (2023) | 0.721 (2024)",
+       x = "Predicted Standing",
+       y = "Actual Standing",
+       color = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 16),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "bottom")
+
+ggsave("championship_prediction.png", width = 10, height = 6, dpi = 300)
+```
+
+
+```{r}
+# 7. Enhanced Talladega simulation with insights
+talladega_insights <- talladega_results |>
+  mutate(
+    tier = case_when(
+      predicted_rank <= 10 ~ "🏆 Predicted Top 10",
+      predicted_rank <= 20 ~ "📊 Predicted Mid-Pack",
+      TRUE ~ "📉 Predicted Backmarker"
+    )
+  ) |>
+  group_by(archetype_label, tier) |>
+  summarise(count = n(), .groups = "drop") |>
+  pivot_wider(names_from = tier, values_from = count, values_fill = 0)
+
+# Create a summary table for presentation
+talladega_summary <- talladega_results |>
+  group_by(archetype_label) |>
+  summarise(
+    avg_predicted_finish = mean(predicted_rank),
+    best_predicted = min(predicted_rank),
+    worst_predicted = max(predicted_rank),
+    n_drivers = n()
+  ) |>
+  arrange(avg_predicted_finish)
+
+gt(talladega_summary) |>
+  tab_header(
+    title = "Talladega Superspeedway: Predicted Performance by Archetype",
+    subtitle = "Aggressive Drafters dominate — Survive and Advance struggle"
+  ) |>
+  cols_label(
+    archetype_label = "Archetype",
+    avg_predicted_finish = "Avg Predicted Finish",
+    best_predicted = "Best",
+    worst_predicted = "Worst",
+    n_drivers = "N"
+  ) |>
+  fmt_number(columns = avg_predicted_finish, decimals = 1) |>
+  data_color(
+    columns = avg_predicted_finish,
+    colors = scales::col_numeric(palette = c("#2ecc71", "#f39c12", "#e74c3c"), domain = NULL)
+```
+
+
+```{r}
+# 8. Superspeedway equalizer effect
+superspeedway_analysis <- within_track_clusters |>
+  filter(track_type == "Superspeedway") |>
+  group_by(archetype_label) |>
+  summarise(
+    avg_rel_finish = mean(avg_rel_finish),
+    dnf_rate = mean(dnf_rate),
+    n = n()
+  ) |>
+  arrange(avg_rel_finish)
+
+# Create a lollipop chart
+ggplot(superspeedway_analysis, aes(x = avg_rel_finish, y = reorder(archetype_label, avg_rel_finish))) +
+  geom_segment(aes(xend = 0, yend = archetype_label), color = "gray70", linewidth = 1) +
+  geom_point(aes(size = dnf_rate, color = avg_rel_finish < 0), stroke = 1.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 1) +
+  scale_color_manual(values = c("TRUE" = "#2ecc71", "FALSE" = "#e74c3c"),
+                     labels = c("Better than field", "Worse than field")) +
+  scale_size_continuous(name = "DNF Rate", labels = scales::percent) +
+  labs(title = "Superspeedways Are the Great Equalizer",
+       subtitle = "Smallest performance gap between archetypes | High DNF rates across all styles",
+       x = "Average Relative Finish (Negative = Better)",
+       y = NULL,
+       caption = "The 'superspeedway equalizer' effect: pack racing narrows the field") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 16),
+        plot.subtitle = element_text(size = 11, color = "gray40"),
+        legend.position = "bottom")
+
+ggsave("superspeedway_equalizer.png", width = 9, height = 5, dpi = 300)
+```
+```{r}
+# Summary of feature ranges by track type
+within_track_profiles |>
+  group_by(track_type) |>
+  summarise(
+    pos_gained_range = range(avg_rel_pos_gained),
+    stage_pts_range = range(avg_rel_stage_pts),
+    dnf_range = range(dnf_rate)
+  )
+```
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# RUN THIS FOR RACE PREDICTION MODEL NUMBERS FROM YOUR PAPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 1. Original Model (Start + track_type + archetype + historical)
+set.seed(490)
+rf_original <- randomForest(
+  Finish ~ Start + track_type + archetype_label + avg_rel_finish,
+  data = train_data,
+  ntree = 500,
+  mtry = 2,
+  importance = TRUE
+)
+
+# Original model performance
+pred_original <- predict(rf_original, newdata = test_data)
+rmse_original <- sqrt(mean((pred_original - test_data$Finish)^2))
+mae_original <- mean(abs(pred_original - test_data$Finish))
+
+cat("Original Model RMSE:", round(rmse_original, 2), "\n")
+cat("Original Model MAE:", round(mae_original, 2), "\n")
+
+# 2. Enhanced Model (with recent form + track history + manufacturer)
+set.seed(490)
+rf_enhanced <- randomForest(
+  Finish ~ Start + track_type + archetype_label + avg_rel_finish + 
+           recent_form_5 + track_hist_avg + Make,
+  data = train_enhanced,
+  ntree = 500,
+  mtry = 3,
+  importance = TRUE
+)
+
+# Enhanced model performance
+pred_enhanced <- predict(rf_enhanced, newdata = test_enhanced)
+rmse_enhanced <- sqrt(mean((pred_enhanced - test_enhanced$Finish)^2))
+mae_enhanced <- mean(abs(pred_enhanced - test_enhanced$Finish))
+
+cat("Enhanced Model RMSE:", round(rmse_enhanced, 2), "\n")
+cat("Enhanced Model MAE:", round(mae_enhanced, 2), "\n")
+
+# 3. Feature importance
+importance_df <- importance(rf_enhanced) |>
+  as.data.frame() |>
+  rownames_to_column("Feature") |>
+  arrange(desc(`%IncMSE`))
+
+print(importance_df)
+
+# 4. Stage points models
+set.seed(490)
+rf_s1 <- randomForest(
+  S1 ~ Start + track_type + archetype_label + avg_rel_finish + recent_form_5 + track_hist_avg + Make,
+  data = train_enhanced, ntree = 500, mtry = 3
+)
+
+rf_s2 <- randomForest(
+  S2 ~ Start + track_type + archetype_label + avg_rel_finish + recent_form_5 + track_hist_avg + Make,
+  data = train_enhanced, ntree = 500, mtry = 3
+)
+
+pred_s1 <- predict(rf_s1, newdata = test_enhanced)
+pred_s2 <- predict(rf_s2, newdata = test_enhanced)
+
+rmse_s1 <- sqrt(mean((pred_s1 - test_enhanced$S1)^2, na.rm = TRUE))
+rmse_s2 <- sqrt(mean((pred_s2 - test_enhanced$S2)^2, na.rm = TRUE))
+
+cat("S1 RMSE:", round(rmse_s1, 2), "\n")
+cat("S2 RMSE:", round(rmse_s2, 2), "\n")
+
+# 5. Championship prediction accuracy
+# Get standings correlation by season
+predicted_standings |>
+  group_by(Season) |>
+  summarise(
+    correlation = cor(pred_standing, actual_standing, method = "spearman"),
+    avg_error = mean(abs(actual_standing - pred_standing))
+  ) |>
+  print()
+```
+```{r}
+# Cleaner version with bars sorted descending
+p_clean <- ggplot(importance_plot_df, aes(x = reorder(Feature, IncMSE), y = IncMSE, fill = color)) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  geom_text(aes(label = paste0(round(IncMSE, 1), "%")), 
+            hjust = -0.2, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("#e74c3c", "#3498db")) +
+  scale_y_continuous(limits = c(-5, 55),
+                     expand = expansion(mult = c(0.01, 0.05))) +
+  coord_flip() +
+  labs(title = "Feature Importance: Random Forest Race Model",
+       subtitle = "Behavioral Archetype ranks #6 at 10.1% increase in MSE",
+       x = NULL,
+       y = "% Increase in Mean Squared Error",
+       caption = "Track Type shows negative importance (removing it slightly improves the model)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 16, color = "#1a1a2e"),
+        plot.subtitle = element_text(size = 11, color = "gray40"),
+        panel.grid.major.y = element_blank(),
+        axis.text = element_text(size = 11))
+
+p_clean
+ggsave("feature_importance_clean.png", p_clean, width = 10, height = 6, dpi = 300)
+```
+```{r}
+# Faceted version
+p_faceted <- predicted_standings |>
+  filter(Season %in% c(2023, 2024)) |>
+  mutate(
+    Season_label = paste(Season, "Season"),
+    correlation = ifelse(Season == 2023, "r = 0.828", "r = 0.721"),
+    label_driver = ifelse(pred_standing <= 5 | actual_standing <= 5, 
+                          as.character(Driver), NA)
+  ) |>
+  ggplot(aes(x = pred_standing, y = actual_standing)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", 
+              color = "gray50", linewidth = 1) +
+  geom_point(aes(color = Season), size = 4, alpha = 0.8, show.legend = FALSE) +
+  geom_text_repel(aes(label = label_driver), size = 3.5, max.overlaps = 10) +
+  geom_text(aes(x = 25, y = 5, label = correlation), 
+            size = 5, fontface = "bold", color = "gray30") +
+  scale_x_reverse(limits = c(32, 1), breaks = seq(0, 32, by = 10)) +
+  scale_y_reverse(limits = c(32, 1), breaks = seq(0, 32, by = 10)) +
+  scale_color_manual(values = c("2023" = "#e74c3c", "2024" = "#3498db")) +
+  labs(title = "Predicted vs. Actual Championship Standings",
+       x = "Predicted Standing (1 = Best)",
+       y = "Actual Standing (1 = Best)") +
+  facet_wrap(~ Season_label, ncol = 2) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 16),
+        strip.text = element_text(face = "bold", size = 12),
+        panel.grid.minor = element_blank())
+
+p_faceted
+ggsave("predicted_vs_actual_faceted.png", p_faceted, width = 12, height = 6, dpi = 300)
+```
+
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# CREATE RACE PREDICTIONS FROM SCRATCH
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Make sure enhanced model exists
+if(!exists("rf_enhanced")) {
+  cat("Need to train enhanced model first. Run this:\n")
+  cat("set.seed(490)\n")
+  cat("rf_enhanced <- randomForest(\n")
+  cat("  Finish ~ Start + track_type + archetype_label + avg_rel_finish +\n")
+  cat("           recent_form_5 + track_hist_avg + Make,\n")
+  cat("  data = train_enhanced, ntree = 500, mtry = 3, importance = TRUE\n")
+  cat(")\n")
+}
+
+# Get predictions for all test races
+all_race_predictions <- test_enhanced |>
+  mutate(
+    pred_finish = predict(rf_enhanced, newdata = test_enhanced)
+  ) |>
+  group_by(Season, Race, Track, track_type) |>
+  mutate(
+    pred_rank = rank(pred_finish, ties.method = "first"),
+    actual_rank = rank(Finish, ties.method = "first")
+  ) |>
+  ungroup()
+
+# Check how many races
+cat("Number of races in test set:", all_race_predictions |> distinct(Season, Race) |> nrow(), "\n")
+cat("Races:\n")
+all_race_predictions |> distinct(Season, Race, Track) |> print()
+```
+```{r}
+available_races <- all_race_predictions |>
+  distinct(Season, Track, Race) |>
+  arrange(Season, Race)
+
+print(available_races)
+
+# Pick the first race (change this to any race you want)
+first_race <- available_races |> slice(1)
+
+cat("\nPlotting:", first_race$Season, first_race$Track, "- Race", first_race$Race, "\n")
+
+# Plot that race
+race_data <- all_race_predictions |>
+  filter(Season == first_race$Season, Race == first_race$Race)
+
+p <- ggplot(race_data, aes(x = pred_rank, y = actual_rank)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50", linewidth = 1) +
+  geom_point(color = "#e74c3c", size = 3.5, alpha = 0.7) +
+  geom_text_repel(aes(label = Driver), size = 3, max.overlaps = 15) +
+  scale_x_continuous(limits = c(1, 40), breaks = seq(0, 40, by = 10)) +
+  scale_y_continuous(limits = c(1, 40), breaks = seq(0, 40, by = 10)) +
+  labs(title = paste(first_race$Season, first_race$Track),
+       x = "Predicted Finish Position",
+       y = "Actual Finish Position") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+p
+ggsave("race_predictions.png", p, width = 10, height = 8, dpi = 300)
+```
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# ROAD COURSE RACE PREDICTIONS (Blue Theme - No Spearman)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Find a road course race in the test set
+road_course_race <- all_race_predictions |>
+  filter(track_type == "Road Course", Season >= 2023) |>
+  distinct(Season, Track, Race) |>
+  slice(1)
+
+# If no road course in test set, check training set
+if(nrow(road_course_race) == 0) {
+  road_course_race <- all_race_predictions |>
+    filter(track_type == "Road Course") |>
+    distinct(Season, Track, Race) |>
+    slice(1)
+}
+
+cat("Plotting Road Course:", road_course_race$Season, road_course_race$Track, "- Race", road_course_race$Race, "\n")
+
+# Get data for that race
+race_data_rc <- all_race_predictions |>
+  filter(Season == road_course_race$Season, 
+         Race == road_course_race$Race,
+         track_type == "Road Course") |>
+  mutate(
+    # Label top 10 and big errors
+    label_driver = ifelse(pred_rank <= 10 | actual_rank <= 10 | 
+                          abs(pred_rank - actual_rank) > 10,
+                          as.character(Driver), NA)
+  )
+
+# Create blue-themed plot (no Spearman)
+p_roadcourse <- ggplot(race_data_rc, aes(x = pred_rank, y = actual_rank)) +
+  # Perfect prediction line
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", 
+              color = "gray50", linewidth = 1.2) +
+  # Blue points
+  geom_point(color = "#3498db", size = 4, alpha = 0.8) +
+  # Driver labels
+  geom_text_repel(aes(label = label_driver), size = 3.5, 
+                  fontface = "bold", max.overlaps = 15) +
+  # Scales
+  scale_x_continuous(limits = c(1, 40), breaks = seq(0, 40, by = 10)) +
+  scale_y_continuous(limits = c(1, 40), breaks = seq(0, 40, by = 10)) +
+  # Labels
+  labs(title = paste(road_course_race$Season, road_course_race$Track, "Road Course"),
+       x = "Predicted Finish Position",
+       y = "Actual Finish Position",
+       caption = "Dashed line = perfect prediction") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 16, color = "#1a1a2e"),
+        plot.subtitle = element_text(size = 11, color = "gray40"),
+        panel.grid.minor = element_blank())
+
+p_roadcourse
+ggsave("road_course_predictions.png", p_roadcourse, width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# NASCAR POINTS SYSTEM - SINGLE NARROW TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+
+library(gt)
+library(tidyverse)
+
+# Create combined data frame
+points_combined <- data.frame(
+  Finish_Position = 1:40,
+  Finish_Points = c(40, 35, 34, 33, 32, 31, 30, 29, 28, 27,
+                    26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+                    16, 15, 14, 13, 12, 11, 10, 9, 8, 7,
+                    6, 5, 4, 3, 2, 1, 1, 1, 1, 1),
+  Stage_Points = c(10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 
+                   rep(NA, 30))
+)
+
+# Create narrow table
+points_combined |>
+  gt() |>
+  tab_header(
+    title = md("**NASCAR Cup Series Points System**"),
+    subtitle = "Stage points (top 10) + Finish points = Total race points"
+  ) |>
+  cols_label(
+    Finish_Position = "Finish",
+    Finish_Points = "Finish Pts",
+    Stage_Points = "Stage Pts"
+  ) |>
+  # Shade top 10 finishes
+  tab_style(
+    style = cell_fill(color = "#e74c3c", alpha = 0.12),
+    locations = cells_body(rows = 1:10)
+  ) |>
+  # Make column labels bold
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  ) |>
+  # Center align all columns
+  cols_align(align = "center", columns = everything()) |>
+  # Footnotes
+  tab_footnote(
+    footnote = "Stage points awarded at end of Stage 1 and Stage 2",
+    locations = cells_column_labels(columns = Stage_Points)
+  ) |>
+  tab_footnote(
+    footnote = "Positions 36-40 each receive 1 finish point",
+    locations = cells_body(rows = 36:40, columns = Finish_Points)
+  ) |>
+  # Narrow styling
+  opt_table_font(font = list(google_font("Lato"), default_fonts())) |>
+  tab_options(
+    table.width = pct(40),
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 10,
+    column_labels.font.size = 10,
+    table.font.size = 9,
+    table.background.color = "white"
+  )
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# CREATE AND SAVE NASCAR POINTS TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+
+library(gt)
+library(tidyverse)
+
+# Create combined data frame
+points_combined <- data.frame(
+  Finish_Position = 1:40,
+  Finish_Points = c(40, 35, 34, 33, 32, 31, 30, 29, 28, 27,
+                    26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+                    16, 15, 14, 13, 12, 11, 10, 9, 8, 7,
+                    6, 5, 4, 3, 2, 1, 1, 1, 1, 1),
+  Stage_Points = c(10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 
+                   rep(NA, 30))
+)
+
+# Create the table and assign to points_table
+points_table <- points_combined |>
+  gt() |>
+  tab_header(
+    title = md("**NASCAR Cup Series Points System**"),
+    subtitle = "Stage points (top 10) + Finish points = Total race points"
+  ) |>
+  cols_label(
+    Finish_Position = "Finish",
+    Finish_Points = "Finish Pts",
+    Stage_Points = "Stage Pts"
+  ) |>
+  tab_style(
+    style = cell_fill(color = "#e74c3c", alpha = 0.12),
+    locations = cells_body(rows = 1:10)
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  ) |>
+  cols_align(align = "center", columns = everything()) |>
+  tab_footnote(
+    footnote = "Stage points awarded at end of Stage 1 and Stage 2",
+    locations = cells_column_labels(columns = Stage_Points)
+  ) |>
+  tab_footnote(
+    footnote = "Positions 36-40 each receive 1 finish point",
+    locations = cells_body(rows = 36:40, columns = Finish_Points)
+  ) |>
+  opt_table_font(font = list(google_font("Lato"), default_fonts())) |>
+  tab_options(
+    table.width = pct(40),
+    heading.title.font.size = 14,
+    heading.subtitle.font.size = 10,
+    column_labels.font.size = 10,
+    table.font.size = 9,
+    table.background.color = "white"
+  )
+
+# Now save the table
+gtsave(points_table, "nascar_points_table.pdf", zoom = 2)
+
+# Also save as PNG for easy viewing
+gtsave(points_table, "nascar_points_table.png")
+```
+
+
+```{r}
+p_clean <- importance_df |>
+  ggplot(aes(x = IncMSE, y = reorder(Feature, IncMSE))) +
+  geom_col(fill = "#3498db", width = 0.7) +
+  geom_col(data = subset(importance_df, Feature == "Behavioral Archetype"), 
+           fill = "#e74c3c", width = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_x_continuous(expand = expansion(mult = c(0.01, 0.05))) +
+  labs(title = "Race Prediction: Feature Importance",
+       x = "% Increase in MSE",
+       y = NULL) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0),
+    plot.title.position = "plot"
+  )
+
+p_clean
+ggsave("feature_importance_simple.png", p_clean, width = 7, height = 4, dpi = 300)
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# PREDICTED vs. ACTUAL FINISH POSITIONS - TWO RACES
+# ══════════════════════════════════════════════════════════════════════════════
+
+library(ggplot2)
+library(ggrepel)
+
+# Get data for both races
+cota_data <- all_race_predictions |>
+  filter(Track == "Circuit of the Americas", Season == 2023) |>
+  mutate(
+    pred_rank = rank(pred_finish, ties.method = "first"),
+    actual_rank = rank(Finish, ties.method = "first"),
+    label_driver = ifelse(pred_rank <= 10 | actual_rank <= 10, as.character(Driver), NA)
+  )
+
+daytona_data <- all_race_predictions |>
+  filter(Track == "Daytona International Speedway", Season == 2023) |>
+  mutate(
+    pred_rank = rank(pred_finish, ties.method = "first"),
+    actual_rank = rank(Finish, ties.method = "first"),
+    label_driver = ifelse(pred_rank <= 10 | actual_rank <= 10, as.character(Driver), NA)
+  )
+
+# Plot 1: Circuit of the Americas (Green)
+p_cota <- ggplot(cota_data, aes(x = pred_rank, y = actual_rank)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50", linewidth = 1) +
+  geom_point(color = "#2ecc71", size = 4, alpha = 0.8) +
+  geom_text_repel(aes(label = label_driver), size = 3, max.overlaps = 15) +
+  scale_x_continuous(limits = c(1, 40), breaks = seq(0, 40, by = 10)) +
+  scale_y_continuous(limits = c(1, 40), breaks = seq(0, 40, by = 10)) +
+  labs(title = "Circuit of the Americas (Road Course)",
+       subtitle = "2023 Race | Green = Predicted vs. Actual Finish",
+       x = "Predicted Finish Position",
+       y = "Actual Finish Position") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, color = "gray40"))
+
+# Plot 2: Daytona (Purple)
+p_daytona <- ggplot(daytona_data, aes(x = pred_rank, y = actual_rank)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50", linewidth = 1) +
+  geom_point(color = "#9b59b6", size = 4, alpha = 0.8) +
+  geom_text_repel(aes(label = label_driver), size = 3, max.overlaps = 15) +
+  scale_x_continuous(limits = c(1, 40), breaks = seq(0, 40, by = 10)) +
+  scale_y_continuous(limits = c(1, 40), breaks = seq(0, 40, by = 10)) +
+  labs(title = "Daytona International Speedway (Superspeedway)",
+       subtitle = "2023 Race | Purple = Predicted vs. Actual Finish",
+       x = "Predicted Finish Position",
+       y = "Actual Finish Position") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, color = "gray40"))
+
+# Display both plots
+p_cota
+p_daytona
+
+# Save both
+ggsave("cota_predictions.png", p_cota, width = 8, height = 7, dpi = 300)
+ggsave("daytona_predictions.png", p_daytona, width = 8, height = 7, dpi = 300)
+```
+
+```{r}
+saveRDS(within_track_clusters, "within_track_clusters.rds")
+saveRDS(rf_enhanced,           "rf_enhanced.rds")
+saveRDS(rf_s1,                 "rf_s1.rds")
+saveRDS(rf_s2,                 "rf_s2.rds")
+saveRDS(enhanced_model_data,   "enhanced_model_data.rds")
+saveRDS(archetype_colors,      "archetype_colors.rds")
+```
+
+```{r}
+cup_filtered |>
+  distinct(Season, Race, Track, track_type) |>
+  dplyr::count(Season, track_type) |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course"))) |>
+  ggplot(aes(x = factor(Season), y = n, fill = track_type)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c("Short Track"   = "#e74c3c",
+                               "Intermediate"  = "#3498db",
+                               "Superspeedway" = "#2ecc71",
+                               "Road Course"   = "#f39c12")) +
+  labs(title = "Race Count by Track Type and Season (2017-2024)",
+       x = "Season", y = "Number of Races", fill = "Track Type") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+```{r}
+intermediate_profiles <- within_track_profiles |>
+  filter(track_type == "Intermediate")
+
+features_within <- c("avg_rel_pos_gained", "avg_rel_stage_pts",
+                      "rel_finish_variance", "dnf_rate")
+
+intermediate_scaled <- intermediate_profiles |>
+  select(all_of(features_within)) |>
+  scale()
+
+p_elbow <- fviz_nbclust(intermediate_scaled, kmeans, method = "wss") +
+  labs(title = "Elbow Method — Intermediate Tracks")
+p_silhouette <- fviz_nbclust(intermediate_scaled, kmeans, method = "silhouette") +
+  labs(title = "Silhouette Method — Intermediate Tracks")
+print(p_elbow)
+print(p_silhouette)
+```
+```{r}
+heatmap_df <- within_track_clusters |>
+  select(Driver, track_type, archetype_label, avg_rel_finish) |>
+  mutate(
+    Driver = fct_reorder(Driver,
+                         avg_rel_finish * (track_type == "Intermediate"),
+                         .fun = sum),
+    track_type = factor(track_type,
+                        levels = c("Short Track", "Intermediate",
+                                   "Superspeedway", "Road Course"))
+  )
+
+ggplot(heatmap_df, aes(x = track_type, y = Driver, fill = archetype_label)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = archetype_label), size = 2.3,
+            color = "white", fontface = "bold") +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title    = "Driver Behavioral Archetypes by Track Type",
+       subtitle = "Drivers ordered by intermediate track relative finish",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "none", panel.grid = element_blank(),
+        axis.text.y = element_text(size = 8))
+```
+```{r}
+bar_df <- within_track_clusters |>
+  group_by(track_type, archetype_label) |>
+  summarise(avg_rel_finish = mean(avg_rel_finish, na.rm = TRUE),
+            n = n(), .groups = "drop") |>
+  mutate(
+    track_type = factor(track_type,
+                        levels = c("Short Track", "Intermediate",
+                                   "Superspeedway", "Road Course")),
+    archetype_label = factor(archetype_label)
+  )
+
+ggplot(bar_df, aes(x = reorder(archetype_label, avg_rel_finish),
+                   y = avg_rel_finish, fill = archetype_label)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = round(avg_rel_finish, 1)),
+            hjust = ifelse(bar_df$avg_rel_finish < 0, 1.1, -0.1),
+            size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = archetype_colors) +
+  coord_flip() +
+  facet_wrap(~ track_type, scales = "free", ncol = 2) +
+  labs(title    = "Average Relative Finish by Archetype and Track Type",
+       subtitle = "Negative = better than field average",
+       x = NULL, y = "Avg Relative Finish vs Field") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold"),
+        panel.grid.major.y = element_blank())
+```
+
+```{r}
+alluvial_df <- within_track_clusters |>
+  select(Driver, track_type, archetype_label) |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course"))) |>
+  pivot_wider(names_from = track_type, values_from = archetype_label) |>
+  drop_na() |>
+  pivot_longer(-Driver, names_to = "track_type", values_to = "archetype_label") |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course")))
+
+ggplot(alluvial_df,
+       aes(x = track_type, stratum = archetype_label, alluvium = Driver,
+           fill = archetype_label, label = archetype_label)) +
+  geom_flow(alpha = 0.5) +
+  geom_stratum(width = 0.35) +
+  geom_text(stat = "stratum", size = 2.8, fontface = "bold", color = "black") +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title    = "Drivers Don't Have One Racing Identity",
+       subtitle = "Each line represents one driver's behavioral journey across track types",
+       x = NULL, y = NULL,
+       caption = "Source: NASCAR Cup Series 2017-2024 | N=32 full-time drivers") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 16),
+        legend.position = "none",
+        axis.text.y = element_blank(),
+        panel.grid = element_blank())
+```
+
+```{r}
+driver_name <- "Chase Elliott"
+elliott_archetypes <- within_track_clusters |>
+  filter(Driver == driver_name) |>
+  select(track_type, archetype_label, avg_rel_pos_gained,
+         avg_rel_stage_pts, rel_finish_variance, dnf_rate, avg_rel_finish) |>
+  mutate(track_type = factor(track_type,
+                             levels = c("Short Track", "Intermediate",
+                                        "Superspeedway", "Road Course")))
+
+# Archetype journey tiles
+ggplot(elliott_archetypes,
+       aes(x = track_type, y = 1, fill = archetype_label)) +
+  geom_tile(color = "white", linewidth = 2, height = 0.5) +
+  geom_text(aes(label = archetype_label), fontface = "bold",
+            color = "white", size = 3) +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title = paste(driver_name, "— Behavioral Archetype by Track Type"),
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), legend.position = "none",
+        panel.grid = element_blank(),
+        plot.title = element_text(face = "bold", size = 14))
+
+# Relative finish bar chart
+ggplot(elliott_archetypes,
+       aes(x = track_type, y = avg_rel_finish, fill = archetype_label)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_text(aes(label = round(avg_rel_finish, 2)),
+            vjust = ifelse(elliott_archetypes$avg_rel_finish < 0, 1.5, -0.5),
+            fontface = "bold", size = 4) +
+  scale_fill_manual(values = archetype_colors) +
+  labs(title    = paste(driver_name, "— Avg Relative Finish by Track Type"),
+       subtitle = "Negative = better than field average",
+       x = NULL, y = "Avg Relative Finish vs Field") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```
+```{r}
+importance_df <- importance(rf_enhanced) |>
+  as.data.frame() |>
+  rownames_to_column("Feature") |>
+  arrange(desc(`%IncMSE`)) |>
+  mutate(
+    Feature_clean = case_when(
+      Feature == "avg_rel_finish"  ~ "Historical Performance",
+      Feature == "Start"           ~ "Starting Position",
+      Feature == "recent_form_5"   ~ "Recent Form (5 races)",
+      Feature == "track_hist_avg"  ~ "Track History",
+      Feature == "Make"            ~ "Manufacturer",
+      Feature == "archetype_label" ~ "Behavioral Archetype",
+      Feature == "track_type"      ~ "Track Type",
+      TRUE ~ Feature
+    )
+  )
+
+max_mse <- max(importance_df$`%IncMSE`)
+
+ggplot(importance_df,
+       aes(x = `%IncMSE`,
+           y = reorder(Feature_clean, `%IncMSE`),
+           fill = Feature_clean == "Behavioral Archetype")) +
+  geom_col(show.legend = FALSE, width = 0.7) +
+  geom_text(aes(label = paste0(round(`%IncMSE`, 1), "%")),
+            hjust = -0.2, size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c("FALSE" = "#e74c3c", "TRUE" = "#3498db")) +
+  scale_x_continuous(limits = c(min(importance_df$`%IncMSE`) - 5,
+                                 max_mse * 1.2),
+                     expand = expansion(mult = c(0.01, 0))) +
+  labs(title    = "Feature Importance: Random Forest Race Prediction Model",
+       x        = "% Increase in MSE When Feature Removed",
+       y        = NULL,
+       caption  = "Blue bar = Behavioral Archetype | Training: 2017-2022 | Test: 2023-2024") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        panel.grid.major.y = element_blank())
+```
+
